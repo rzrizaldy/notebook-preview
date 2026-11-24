@@ -1,7 +1,7 @@
 {
   "name": "notebook-preview",
-  "version": "0.2.0",
-  "description": "Open and edit Jupyter notebooks (.ipynb) and Markdown (.md) as VS Code-style cells in a pane beside the chat.",
+  "version": "0.3.0",
+  "description": "Open and edit Jupyter notebooks (.ipynb) and Markdown (.md) as VS Code-style cells beside the chat, and highlight code to edit it with Claude.",
   "author": {
     "name": "Rizaldy"
   },

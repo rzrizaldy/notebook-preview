@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { editMarkdown, editNotebook, fileLinks, paginate, parseMarkdown, parseNotebook, pathFrom, toLines } from '../hooks/notebook'
+import { chatHandoff, editMarkdown, editNotebook, extractCode, fileLinks, lineDiff, locate, paginate, parseMarkdown, parseNotebook, pathFrom, toLines } from '../hooks/notebook'
 
 const NOTEBOOK = JSON.stringify(
   {
@@ -148,5 +148,56 @@ test('a reply with a notebook link is redrawn so the link opens the pane', async
   const ui = await $.ui.mount({ ...reply, surface: 'desktop' })
   const drawn = await ui.find({ key: 'reply-m1' })
   expect(drawn?.text).toContain('file:///x/demo.ipynb')
+  await ui.unmount()
+})
+
+test('a highlight is found in its cell, and a diff and handoff are built', () => {
+  const source = 'for i in range(len(rows)):\n    if rows[i]["score"] > 0.5:\n        keep.append(rows[i])\nprint(len(keep))'
+  const span = locate('if rows[i]["score"] > 0.5:\n keep.append(rows[i])', source)
+  expect(span).toEqual({ start: 2, end: 3, text: '    if rows[i]["score"] > 0.5:\n        keep.append(rows[i])' })
+  expect(locate('not here at all', source)).toBeNull()
+
+  expect(extractCode('Sure:\n```python\nx = 1\n```\n')).toBe('x = 1')
+  const { diff, added, removed } = lineDiff('a\nb\nc', 'a\nB\nc')
+  expect(diff).toBe('@@ -1,3 +1,3 @@\n a\n-b\n+B\n c')
+  expect([added, removed]).toEqual([1, 1])
+  expect(chatHandoff('n.ipynb', 4, 'python', span, source, 'vectorize')).toContain('cell 4, lines 2-3')
+})
+
+test('highlight, ✦ Edit, review the diff, accept', async ($, on) => {
+  let disk = NOTEBOOK
+  let asked = ''
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/x' }))
+  on('clock.every', () => ({ value: undefined }))
+  on('fs.exists', (_, e) => ({ value: e.path.endsWith('demo.ipynb') }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: disk.length, mtimeMs: 1, isLink: false } }))
+  on('fs.read', () => ({ value: disk }))
+  on('fs.write', (_, e) => {
+    disk = e.text
+    return { value: undefined }
+  })
+  on('ui.selection', () => ({ value: { text: 'print(torch.cuda.is_available())' } }))
+  on('model.complete', (_, e) => {
+    asked = typeof e.prompt === 'string' ? e.prompt : ''
+    return { value: { isAnswered: true, text: '```python\nimport torch\nprint(torch.cuda.device_count())\n```', usage: {} } } as never
+  })
+
+  await $.session.start({ cwd: '/x', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'notebook', args: 'demo.ipynb' } as never)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.press({ key: 'ai-selection' })
+  expect((await ui.find({ type: 'Text', text: /lines 2–2 of cell 2/ }))).toBeDefined()
+  await ui.input({ key: 'ai-input-1', text: 'count the GPUs' })
+  expect(asked).toContain('Change only lines 2-2')
+  expect(asked).toContain('count the GPUs')
+  expect(await ui.find({ key: 'ai-accept-1' })).toBeDefined()
+
+  await ui.press({ key: 'ai-accept-1' })
+  expect(JSON.parse(disk).cells[1].source).toEqual(['import torch\n', 'print(torch.cuda.device_count())'])
+  expect(await ui.find({ key: 'ai-accept-1' })).toBeUndefined()
   await ui.unmount()
 })

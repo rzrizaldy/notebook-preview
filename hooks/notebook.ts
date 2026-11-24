@@ -354,3 +354,108 @@ export function fileLinks(text: string, cwd: string): { text: string; hrefs: str
   })
   return { text: rewritten, hrefs }
 }
+
+// ---------------------------------------------------------------------------
+// ✦ Edit with Claude: find the highlight in a cell, ask for a rewrite, diff it
+// ---------------------------------------------------------------------------
+
+export type Span = { start: number; end: number; text: string }
+
+/**
+ * Where the person's highlight sits in a cell's source: 1-based first and last
+ * line. Whitespace is compared loosely, since a copy of drawn code can differ
+ * in indentation and wrapping. Null when the highlight is not in this cell.
+ */
+export function locate(selection: string, source: string): Span | null {
+  const squash = (s: string) => s.replace(/\s+/g, ' ').trim()
+  const wanted = squash(selection)
+  if (wanted.length < 2) return null
+  const lines = source.split('\n')
+  for (let start = 0; start < lines.length; start++) {
+    let joined = ''
+    for (let end = start; end < lines.length; end++) {
+      joined = squash(`${joined} ${lines[end] ?? ''}`)
+      if (joined.includes(wanted)) {
+        // Shrink from the top while the rest still holds the highlight.
+        let first = start
+        while (first < end && squash(lines.slice(first + 1, end + 1).join(' ')).includes(wanted)) first++
+        return { start: first + 1, end: end + 1, text: lines.slice(first, end + 1).join('\n') }
+      }
+      if (joined.length > wanted.length + 2000) break
+    }
+  }
+  return null
+}
+
+export const QUICK_ASKS = ['Fix the error', 'Simplify', 'Add comments', 'Vectorize with pandas'] as const
+
+export function editPrompt(args: {
+  path: string
+  cellNumber: number
+  cellType: CellType
+  language: string
+  source: string
+  span: Span | null
+  instruction: string
+  error?: string
+}): { system: string; prompt: string } {
+  const lang = args.cellType === 'markdown' ? 'markdown' : args.language
+  const focus =
+    args.span === null
+      ? 'Change the whole cell.'
+      : `Change only lines ${args.span.start}-${args.span.end}, shown here, and keep every other line exactly as it is:\n\`\`\`${lang}\n${args.span.text}\n\`\`\``
+  const error = args.error ? `\n\nThe cell's last run failed with:\n\`\`\`\n${args.error.slice(0, 2000)}\n\`\`\`` : ''
+  return {
+    system:
+      'You edit one cell of a notebook or one section of a Markdown file. Reply with the complete new cell source in a single fenced code block and nothing else: no explanation, no second block.',
+    prompt: `File: ${args.path}, cell ${args.cellNumber} (${args.cellType}, ${lang}).\n\nThe cell now:\n\`\`\`${lang}\n${args.source}\n\`\`\`\n\n${focus}${error}\n\nWhat to change: ${args.instruction}`,
+  }
+}
+
+/** The new source from the model's reply: the first fenced block, else the reply. */
+export function extractCode(reply: string): string {
+  const fence = /```[^\n]*\n([\s\S]*?)\n?```/.exec(reply)
+  return (fence?.[1] ?? reply).replace(/\s+$/, '')
+}
+
+/** A unified diff of two texts as one hunk, for `<Code format="diff">`. */
+export function lineDiff(before: string, after: string): { diff: string; added: number; removed: number } {
+  const a = before.split('\n')
+  const b = after.split('\n')
+  // Longest common subsequence table, from the end.
+  const table: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0))
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      const row = table[i] as number[]
+      row[j] = a[i] === b[j] ? (table[i + 1]?.[j + 1] ?? 0) + 1 : Math.max(table[i + 1]?.[j] ?? 0, row[j + 1] ?? 0)
+    }
+  }
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  let added = 0
+  let removed = 0
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      out.push(` ${a[i]}`)
+      i++
+      j++
+    } else if (i < a.length && (j >= b.length || (table[i + 1]?.[j] ?? 0) >= (table[i]?.[j + 1] ?? 0))) {
+      out.push(`-${a[i]}`)
+      removed++
+      i++
+    } else {
+      out.push(`+${b[j]}`)
+      added++
+      j++
+    }
+  }
+  return { diff: `@@ -1,${a.length} +1,${b.length} @@\n${out.join('\n')}`, added, removed }
+}
+
+/** The text a chat handoff puts in the prompt box. */
+export function chatHandoff(path: string, cellNumber: number, language: string, span: Span | null, source: string, instruction: string): string {
+  const where = span === null ? `cell ${cellNumber}` : `cell ${cellNumber}, lines ${span.start}-${span.end}`
+  const code = span === null ? source : span.text
+  return `In ${path}, ${where}:\n\`\`\`${language}\n${code}\n\`\`\`\n${instruction}`
+}

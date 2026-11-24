@@ -1,8 +1,22 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { PreviewFile, UndoEntry } from '../types'
-import { applyEdit, basename, fileLinks, paginate, parse, pathFrom, previewKind } from './notebook'
+import type { AiEdit, PreviewFile, UndoEntry } from '../types'
+import {
+  QUICK_ASKS,
+  applyEdit,
+  basename,
+  chatHandoff,
+  editPrompt,
+  extractCode,
+  fileLinks,
+  lineDiff,
+  locate,
+  paginate,
+  parse,
+  pathFrom,
+  previewKind,
+} from './notebook'
 import type { Cell, CellType, Doc, Edit, Output } from './notebook'
 
 const PANE = 'notebook-preview'
@@ -30,6 +44,8 @@ const undo = atom({ plugin: 'notebook-preview', key: 'undo' } as const, null as 
 const linkClicks = atom({ plugin: 'notebook-preview', key: 'linkClicks' } as const, true, {
   shape: 'links-1',
 })
+const ai = atom({ plugin: 'notebook-preview', key: 'ai' } as const, null as AiEdit | null, { shape: 'ai-1' })
+const aiModel = atom({ plugin: 'notebook-preview', key: 'aiModel' } as const, 'haiku', { shape: 'model-1' })
 
 const PATH_FIELDS = ['file_path', 'notebook_path', 'path'] as const
 
@@ -83,6 +99,43 @@ async function edit($: EngineInterface, path: string, change: Edit, label: strin
   await bump($)
 }
 
+/** Ask the model for the new cell, then show the diff for review. */
+async function runAi($: EngineInterface, cell: Cell, doc: Doc, instruction: string): Promise<void> {
+  const current = await read($, ai)
+  if (current === null || current.index !== cell.index) return
+  const ask = instruction.trim()
+  if (ask === '') return
+  await update($, ai, (value): AiEdit | null => (value === null ? null : { ...value, instruction: ask, status: 'running', message: '' }))
+  const started = Date.now()
+  const model = await read($, aiModel)
+  const error = cell.outputs.find(o => o.kind === 'error')?.text
+  const { system, prompt } = editPrompt({
+    path: current.path,
+    cellNumber: cell.index + 1,
+    cellType: cell.type,
+    language: doc.language,
+    source: current.original,
+    span: current.span,
+    instruction: ask,
+    ...(error === undefined ? {} : { error }),
+  })
+  const reply = await $.model
+    .complete({ model, system, prompt, maxTokens: 4096, timeoutMs: 90_000 })
+    .catch((reason: unknown) => ({ isAnswered: false as const, reason: String(reason) }))
+  const seconds = ((Date.now() - started) / 1000).toFixed(1)
+  await update($, ai, (value): AiEdit | null => {
+    if (value === null || value.index !== cell.index) return value
+    if (!reply.isAnswered) {
+      return { ...value, status: 'error', message: `Claude didn't answer (${'reason' in reply ? reply.reason : 'no reply'}). Try again, or send it to the chat.` }
+    }
+    const proposed = extractCode(reply.text)
+    if (proposed === value.original.replace(/\s+$/, '')) {
+      return { ...value, status: 'error', message: 'Claude suggested no change. Try saying it another way.' }
+    }
+    return { ...value, status: 'review', proposed, message: `${model} · ${seconds} s` }
+  })
+}
+
 async function exportHtml($: EngineInterface, path: string): Promise<void> {
   const html = path.replace(/\.[^.]+$/, '.html')
   const argv =
@@ -115,6 +168,10 @@ export const register: Register = on => {
     await $.command.register({
       name: 'notebook-links',
       description: 'Turn on or off: clicking a .ipynb or .md link in a reply opens it in the notebook pane',
+    })
+    await $.command.register({
+      name: 'notebook-model',
+      description: 'Model for ✦ Edit in the notebook pane: /notebook-model haiku | sonnet | opus',
     })
 
     // Redraw when the open file changes on disk (Claude, Colab, an editor).
@@ -161,6 +218,14 @@ export const register: Register = on => {
         ? 'Clicking a .ipynb or .md link in a reply now opens it in the notebook pane.'
         : 'Links in replies open as before.',
     }
+  })
+
+  on('command.run', { command: 'notebook-model' }, async ($, e) => {
+    const wanted = e.args.trim()
+    if (wanted === '') return { text: `✦ Edit uses ${await read($, aiModel)}. Change it with /notebook-model haiku | sonnet | opus.` }
+    if (!/^[a-z0-9][a-z0-9.\-]*$/i.test(wanted)) return { text: `Not a model name: ${wanted}` }
+    await update($, aiModel, () => wanted)
+    return { text: `✦ Edit now uses ${wanted}.` }
   })
 
   // Follow notebooks and Markdown files Claude reads, writes or edits.
@@ -238,11 +303,58 @@ export const register: Register = on => {
       await update($, draft, () => '')
       await update($, editing, () => after + 1)
     }
-    const ask = (cell: Cell) =>
-      $.prompt.fill({
-        text: `In ${path}, ${isNotebook ? `cell ${cell.index + 1}` : `the section starting "${cell.source.split('\n')[0]?.slice(0, 60) ?? ''}"`}: `,
+    const aiEdit = await read($, ai)
+    const active = aiEdit !== null && aiEdit.path === path ? aiEdit : null
+
+    // ✦ Edit: the highlighted lines of this cell, or the whole cell.
+    const startAi = async (cell: Cell | null) => {
+      const selected = await $.ui.selection()
+      let target = cell
+      let span = null as ReturnType<typeof locate>
+      if (selected !== undefined && selected.text.trim() !== '') {
+        const candidates = target === null ? doc.cells : [target]
+        for (const candidate of candidates) {
+          const found = locate(selected.text, candidate.source)
+          if (found !== null) {
+            target = candidate
+            span = found
+            break
+          }
+        }
+      }
+      if (target === null) {
+        $.ui.toast('Highlight some lines in a cell first, or use ✦ Edit on a cell.')
+        return
+      }
+      if (target.isCut) {
+        $.ui.toast('This cell is too long to edit in the pane. Send it to the chat instead.')
+        return
+      }
+      await update($, editing, () => null)
+      await update($, ai, () => ({
+        path,
+        index: target.index,
+        span,
+        original: target.source,
+        instruction: '',
+        status: 'composing',
+        proposed: '',
+        message: '',
+      }))
+    }
+    const toChat = async (cell: Cell, instruction: string) => {
+      const span = active?.index === cell.index ? active.span : null
+      await $.prompt.fill({
+        text: chatHandoff(path, cell.index + 1, cell.type === 'markdown' ? 'markdown' : doc.language, span, cell.source, instruction),
         mode: 'insert',
       })
+      await update($, ai, () => null)
+    }
+    const accept = async (cell: Cell) => {
+      if (active === null || active.status !== 'review') return
+      await edit($, path, { op: 'set', index: cell.index, source: active.proposed }, `✦ Edit cell ${cell.index + 1}`)
+      await update($, ai, () => null)
+    }
 
     const drawOutput = (output: Output, key: string) => {
       switch (output.kind) {
@@ -287,8 +399,8 @@ export const register: Register = on => {
         {...float}
         {...reveal(scope)}
       >
-        {!cell.isCut && tool(`edit-${cell.index}`, 'Edit cell', '✎ Edit', () => startEdit(cell))}
-        {tool(`ask-${cell.index}`, 'Ask Claude about this cell', '✦ Ask', () => ask(cell))}
+        {!cell.isCut && tool(`ai-${cell.index}`, 'Edit the highlighted lines, or the cell, with Claude', '✦ Edit', () => startAi(cell))}
+        {!cell.isCut && tool(`edit-${cell.index}`, 'Edit cell by hand', '✎', () => startEdit(cell))}
         {isNotebook &&
           cell.type !== 'raw' &&
           tool(
@@ -338,14 +450,80 @@ export const register: Register = on => {
       </Box>
     )
 
+    // ✦ Edit, under its cell: say what to change, wait, then review the diff.
+    const aiPanel = (cell: Cell, pending: AiEdit) => {
+      const where = pending.span === null ? `the whole cell ${cell.index + 1}` : `lines ${pending.span.start}–${pending.span.end} of cell ${cell.index + 1}`
+      if (pending.status === 'review') {
+        const { diff, added, removed } = lineDiff(pending.original, pending.proposed)
+        return (
+          <Box flexDirection="column" gap={1} marginTop={1} borderStyle="round" borderColor={ACCENT} paddingX={1}>
+            <Box flexDirection="row" justifyContent="space-between">
+              <Text>
+                <Text color={ACCENT}>✦ </Text>
+                {`“${pending.instruction}”`}
+              </Text>
+              <Text dimColor>{`+${added} −${removed} · ${pending.message}`}</Text>
+            </Box>
+            <Code source={diff} format="diff" />
+            <Box flexDirection="row" gap={1} alignItems="center">
+              <Button key={`ai-accept-${cell.index}`} label="✓ Accept" hotkey="a" variant="primary" onPress={() => accept(cell)} />
+              <Button key={`ai-reject-${cell.index}`} label="✕ Reject" hotkey="x" onPress={() => update($, ai, () => null)} />
+              <Button key={`ai-retry-${cell.index}`} label="↻ Try again" onPress={() => runAi($, cell, doc, pending.instruction)} />
+              <Button key={`ai-chat-${cell.index}`} label="Continue in chat →" plain onPress={() => toChat(cell, pending.instruction)} />
+            </Box>
+            <Text dimColor>Nothing is saved until you accept. Undo in the header reverts it.</Text>
+          </Box>
+        )
+      }
+      const isRunning = pending.status === 'running'
+      return (
+        <Box flexDirection="column" gap={1} marginTop={1} borderStyle="round" borderColor={ACCENT} paddingX={1}>
+          <Text dimColor>
+            <Text color={ACCENT}>✦ </Text>
+            {isRunning ? `Claude is editing ${where}…` : `Edit ${where} with Claude`}
+          </Text>
+          {pending.span !== null && <Code source={pending.span.text} language={cell.type === 'markdown' ? 'markdown' : doc.language} startLine={pending.span.start} />}
+          {!isRunning && (
+            <Input
+              key={`ai-input-${cell.index}`}
+              placeholder="Describe the change, e.g. use a list comprehension"
+              value={pending.instruction}
+              autoFocus
+              submitLabel="Edit inline"
+              onInput={value => update($, ai, v => (v === null ? v : { ...v, instruction: value }))}
+              onSubmit={value => runAi($, cell, doc, value)}
+            />
+          )}
+          {!isRunning && (
+            <Box flexDirection="row" gap={1} flexWrap="wrap">
+              {QUICK_ASKS.filter(q => q !== 'Fix the error' || cell.outputs.some(o => o.kind === 'error')).map(q => (
+                <Button key={`ai-quick-${cell.index}-${q}`} label={q} plain onPress={() => runAi($, cell, doc, q)} />
+              ))}
+            </Box>
+          )}
+          {pending.status === 'error' && <Text color="error">{pending.message}</Text>}
+          <Box flexDirection="row" gap={1} alignItems="center">
+            {!isRunning && (
+              <Button key={`ai-run-${cell.index}`} label="Edit inline ⏎" variant="primary" onPress={async () => runAi($, cell, doc, (await read($, ai))?.instruction ?? '')} />
+            )}
+            {!isRunning && (
+              <Button key={`ai-send-${cell.index}`} label="Send to chat" onPress={async () => toChat(cell, (await read($, ai))?.instruction ?? '')} />
+            )}
+            <Button key={`ai-cancel-${cell.index}`} label="Cancel" plain onPress={() => update($, ai, () => null)} />
+          </Box>
+        </Box>
+      )
+    }
+
     const drawCell = (cell: Cell) => {
       const scope = `cell-${cell.index}`
       const isEditing = editingIndex === cell.index
+      const aiHere = active !== null && active.index === cell.index ? active : null
       const isCode = cell.type === 'code'
       const gutter = isCode ? `[${cell.count ?? ' '}]` : ''
       return (
         <Box key={scope} flexDirection="column" marginTop={1} hover={{ scope }}>
-          {!canHover && !isEditing && toolbar(cell, scope)}
+          {!canHover && !isEditing && aiHere === null && toolbar(cell, scope)}
           <Box flexDirection="row">
             <Box width={6} flexShrink={0} paddingTop={isCode ? 1 : 0}>
               <Text dimColor hover={{ scope, color: ACCENT }}>
@@ -356,7 +534,7 @@ export const register: Register = on => {
               {isEditing ? (
                 editor(cell)
               ) : isCode ? (
-                <Box borderStyle="round" borderColor="subtle" paddingX={1} hover={{ scope, borderColor: ACCENT }}>
+                <Box borderStyle="round" borderColor={aiHere !== null ? ACCENT : 'subtle'} paddingX={1} hover={{ scope, borderColor: ACCENT }}>
                   <Code source={cell.source === '' ? ' ' : cell.source} language={doc.language} />
                 </Box>
               ) : cell.type === 'markdown' ? (
@@ -366,6 +544,7 @@ export const register: Register = on => {
               ) : (
                 <Code source={cell.source} language="text" />
               )}
+              {aiHere !== null && aiPanel(cell, aiHere)}
               {outputs && cell.outputs.length > 0 && (
                 <Box flexDirection="column" paddingX={1} marginTop={1}>
                   {cell.outputs.map((output, i) => drawOutput(output, `${scope}-out-${i}`))}
@@ -373,8 +552,8 @@ export const register: Register = on => {
               )}
             </Box>
           </Box>
-          {canHover && !isEditing && toolbar(cell, scope)}
-          {!isEditing && adder(cell, scope)}
+          {canHover && !isEditing && aiHere === null && toolbar(cell, scope)}
+          {!isEditing && aiHere === null && adder(cell, scope)}
         </Box>
       )
     }
@@ -404,6 +583,7 @@ export const register: Register = on => {
         </Box>
         <Text dimColor>{doc.summary}</Text>
         <Box flexDirection="row" gap={1} marginTop={1} flexWrap="wrap" alignItems="center">
+          <Button key="ai-selection" label="✦ Edit selection" hotkey="e" variant="primary" onPress={() => startAi(null)} />
           {isNotebook && tool('add-code-top', 'Add code cell at the top', '+ Code', () => insert(-1, 'code'))}
           {tool('add-md-top', isNotebook ? 'Add Markdown cell at the top' : 'Add section at the top', isNotebook ? '+ Markdown' : '+ Section', () => insert(-1, 'markdown'))}
           <Text dimColor>│</Text>

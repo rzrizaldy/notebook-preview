@@ -17,19 +17,29 @@ Claude Code's file view shows a notebook as raw JSON. This pane shows it the way
 - A header with the file name, kernel and GPU (from Colab metadata), and how many cells ran
 - Long notebooks split into pages, so each drawing stays within the app's limit
 
-## Edit cells
+## ✦ Edit with Claude
+
+Highlight a few lines in a cell, then press **✦ Edit selection** in the header (`e`), or **✦ Edit** on the cell. With nothing highlighted, it edits the whole cell.
+
+1. A box opens under the cell, quoting what you highlighted. Type what to change ("use a list comprehension"), or pick a quick ask: *Simplify*, *Add comments*, *Vectorize with pandas*, or *Fix the error* when the cell has a traceback.
+2. **Edit inline** (Enter): Claude rewrites only that cell, and you see a diff with removed lines in red and added lines in green.
+3. **✓ Accept** (`a`) saves it, **✕ Reject** (`x`) drops it, **↻ Try again** asks again. Nothing is written until you accept, and **Undo** in the header still works after.
+
+For bigger changes that span cells or need tools, **Send to chat** puts the file, cell, lines and quoted code in the prompt box, ready for your instruction. **Continue in chat →** does the same from a diff.
+
+Inline edits use a small model call in your session (Haiku by default), which counts toward the session's cost. `/notebook-model sonnet` (or `opus`, `haiku`) changes it.
+
+## Edit cells by hand
 
 Hover a cell and a small toolbar appears at its top-right corner, as in Cursor and VS Code:
 
-- **✎ Edit**: edit the cell in place. Enter saves; Shift+Enter adds a new line.
-- **✦ Ask**: puts "In file.ipynb, cell 12: " in the prompt box, so you can ask Claude to change, explain or fix that cell
+- **✦ Edit**: edit with Claude, above
+- **✎**: edit the cell yourself. Enter saves; Shift+Enter adds a new line.
 - **M↓ / { }**: change the cell to Markdown or to code
 - **↑ / ↓ / ✕**: move the cell up or down, or delete it
 - **+ Code / + Markdown** under each cell: add a new cell below it
 
-Hovered and edited cells are outlined in Claude orange.
-
-Every change is written to the file straight away, in the file's own JSON layout, and existing outputs are kept. **Undo** (`u`) in the header reverts the last change. In a `.md` file each heading starts a section, and you edit, move and add sections the same way.
+Hovered and edited cells are outlined in Claude orange. Every change is written to the file straight away, in the file's own JSON layout, and existing outputs are kept. **Undo** (`u`) in the header reverts the last change. In a `.md` file each heading starts a section, and you edit, move and add sections the same way.
 
 ## Open files
 
@@ -79,6 +89,16 @@ Or try it from a clone without installing:
 ```bash
 claude --plugin-dir /path/to/notebook-preview
 ```
+
+## Roadmap
+
+The aim is a workbench for data science and analytics work inside Claude.
+
+- **Now:** notebooks and Markdown as cells, edit by hand or with ✦ Edit, follow the files Claude opens
+- **Next:** R: `.Rmd` and Quarto `.qmd` files as cells (`{r}` chunks), R-kernel notebooks, stale-output badges after an edit
+- **Later:** run a cell through a local or Colab kernel, CSV and Parquet table previews, plots in the pane once the plugin API can draw images
+
+Ideas and issues are welcome on GitHub.
 
 ## Support
 
