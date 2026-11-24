@@ -1,0 +1,14 @@
+{
+  "name": "notebook-preview",
+  "owner": {
+    "name": "Rizaldy"
+  },
+  "description": "notebook-preview: open and edit Jupyter notebooks and Markdown as cells in a Claude Code pane.",
+  "plugins": [
+    {
+      "name": "notebook-preview",
+      "source": "./",
+      "description": "Open and edit Jupyter notebooks (.ipynb) and Markdown (.md) as VS Code-style cells in a pane beside the chat."
+    }
+  ]
+}

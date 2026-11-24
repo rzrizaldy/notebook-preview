@@ -1,0 +1,20 @@
+{
+  "name": "notebook-preview",
+  "version": "0.2.0",
+  "description": "Open and edit Jupyter notebooks (.ipynb) and Markdown (.md) as VS Code-style cells in a pane beside the chat.",
+  "author": {
+    "name": "Rizaldy"
+  },
+  "license": "MIT",
+  "keywords": [
+    "jupyter",
+    "notebook",
+    "ipynb",
+    "markdown",
+    "data-science",
+    "preview"
+  ],
+  "types": "./types/index.d.ts",
+  "homepage": "https://github.com/rzrizaldy/notebook-preview",
+  "repository": "https://github.com/rzrizaldy/notebook-preview"
+}
